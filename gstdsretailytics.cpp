@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -20,43 +20,19 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-/**
- * There are two threads in the optimized code. input thread and Processing thread.
- * The pre-procesing as required by the algorithm like scaling and color
- * conversion of data is done in input thread. This is done using NvBufSurfTransform's
- * batch conversion APIs to improve performance. The processing of data using custom
- * algorithm and parsing the output and  metadata attachment is done in separate processing
- * thread.
- *
- * There are two queues used for buffering and transferring data between thread:
- * Process_queue and cvmat_queue Process_queue is used to send filled batched data to
- * process thread and cvmat_queue is used to get return empty processed buffers from
- * process thread to input thread.  Two buffers are used in a ping pong manner between
- * the two threads for parallel processing.
- */
-
 #include <string.h>
 #include <string>
 #include <sstream>
 #include <iostream>
 #include <ostream>
 #include <fstream>
-
 #include "gstdsretailytics.h"
-
 #include <sys/time.h>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
-
 GST_DEBUG_CATEGORY_STATIC (gst_dsretailytics_debug);
 #define GST_CAT_DEFAULT gst_dsretailytics_debug
 #define USE_EGLIMAGE 1
-//enable to write transformed cvmat to files
-//#define DSRETAILYTICS_DEBUG
-#ifdef DSRETAILYTICS_DEBUG
-#include "opencv2/imgcodecs.hpp"
-#endif
+/* enable to write transformed cvmat to files */
+/* #define DSRETAILYTICS_DEBUG */
 static GQuark _dsmeta_quark = 0;
 
 /* Enum to identify properties */
@@ -67,7 +43,7 @@ enum
   PROP_PROCESSING_WIDTH,
   PROP_PROCESSING_HEIGHT,
   PROP_PROCESS_FULL_FRAME,
-  PROP_BATCH_SIZE,
+  PROP_BLUR_OBJECTS,
   PROP_GPU_DEVICE_ID
 };
 
@@ -93,8 +69,8 @@ enum
 #define DEFAULT_PROCESSING_WIDTH 640
 #define DEFAULT_PROCESSING_HEIGHT 480
 #define DEFAULT_PROCESS_FULL_FRAME TRUE
+#define DEFAULT_BLUR_OBJECTS FALSE
 #define DEFAULT_GPU_ID 0
-#define DEFAULT_BATCH_SIZE 1
 
 #define RGB_BYTES_PER_PIXEL 3
 #define RGBA_BYTES_PER_PIXEL 4
@@ -153,20 +129,14 @@ static gboolean gst_dsretailytics_set_caps (GstBaseTransform * btrans,
 static gboolean gst_dsretailytics_start (GstBaseTransform * btrans);
 static gboolean gst_dsretailytics_stop (GstBaseTransform * btrans);
 
-static GstFlowReturn
-gst_dsretailytics_submit_input_buffer (GstBaseTransform * btrans,
-    gboolean discont, GstBuffer * inbuf);
-static GstFlowReturn
-gst_dsretailytics_generate_output (GstBaseTransform * btrans, GstBuffer ** outbuf);
+static GstFlowReturn gst_dsretailytics_transform_ip (GstBaseTransform *
+    btrans, GstBuffer * inbuf);
 
 static void
-attach_metadata_full_frame (GstDsRetailytics * dsretailytics,
-    NvDsFrameMeta * frame_meta, gdouble scale_ratio, DsRetailyticsOutput * output,
-    guint batch_id);
+attach_metadata_full_frame (GstDsRetailytics * dsretailytics, NvDsFrameMeta *frame_meta,
+    gdouble scale_ratio, DsRetailyticsOutput * output, guint batch_id);
 static void attach_metadata_object (GstDsRetailytics * dsretailytics,
     NvDsObjectMeta * obj_meta, DsRetailyticsOutput * output);
-
-static gpointer gst_dsretailytics_output_loop (gpointer data);
 
 /* Install properties, set sink and src pad capabilities, override the required
  * functions of the base class, These are common to all instances of the
@@ -179,7 +149,7 @@ gst_dsretailytics_class_init (GstDsRetailyticsClass * klass)
   GstElementClass *gstelement_class;
   GstBaseTransformClass *gstbasetransform_class;
 
-  // Indicates we want to use DS buf api
+  /* Indicates we want to use DS buf api */
   g_setenv ("DS_NEW_BUFAPI", "1", TRUE);
 
   gobject_class = (GObjectClass *) klass;
@@ -194,10 +164,8 @@ gst_dsretailytics_class_init (GstDsRetailyticsClass * klass)
   gstbasetransform_class->start = GST_DEBUG_FUNCPTR (gst_dsretailytics_start);
   gstbasetransform_class->stop = GST_DEBUG_FUNCPTR (gst_dsretailytics_stop);
 
-  gstbasetransform_class->submit_input_buffer =
-      GST_DEBUG_FUNCPTR (gst_dsretailytics_submit_input_buffer);
-  gstbasetransform_class->generate_output =
-      GST_DEBUG_FUNCPTR (gst_dsretailytics_generate_output);
+  gstbasetransform_class->transform_ip =
+      GST_DEBUG_FUNCPTR (gst_dsretailytics_transform_ip);
 
   /* Install properties */
   g_object_class_install_property (gobject_class, PROP_UNIQUE_ID,
@@ -228,12 +196,12 @@ gst_dsretailytics_class_init (GstDsRetailyticsClass * klass)
           "by primary detector", DEFAULT_PROCESS_FULL_FRAME, (GParamFlags)
           (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
-  g_object_class_install_property (gobject_class, PROP_BATCH_SIZE,
-      g_param_spec_uint ("batch-size", "Batch Size",
-          "Maximum batch size for processing",
-          1, NVDSRETAILYTICS_MAX_BATCH_SIZE, DEFAULT_BATCH_SIZE,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
-              GST_PARAM_MUTABLE_READY)));
+  g_object_class_install_property (gobject_class, PROP_BLUR_OBJECTS,
+      g_param_spec_boolean ("blur-objects",
+          "Blur Objects",
+          "Enable to blur the objects detected in full-frame=0 mode"
+          "by primary detector", DEFAULT_BLUR_OBJECTS, (GParamFlags)
+          (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_GPU_DEVICE_ID,
       g_param_spec_uint ("gpu-id",
@@ -274,8 +242,9 @@ gst_dsretailytics_init (GstDsRetailytics * dsretailytics)
   dsretailytics->processing_width = DEFAULT_PROCESSING_WIDTH;
   dsretailytics->processing_height = DEFAULT_PROCESSING_HEIGHT;
   dsretailytics->process_full_frame = DEFAULT_PROCESS_FULL_FRAME;
+  dsretailytics->blur_objects = DEFAULT_BLUR_OBJECTS;
   dsretailytics->gpu_id = DEFAULT_GPU_ID;
-  dsretailytics->max_batch_size = DEFAULT_BATCH_SIZE;
+
   /* This quark is required to identify NvDsMeta when iterating through
    * the buffer metadatas */
   if (!_dsmeta_quark)
@@ -302,11 +271,11 @@ gst_dsretailytics_set_property (GObject * object, guint prop_id,
     case PROP_PROCESS_FULL_FRAME:
       dsretailytics->process_full_frame = g_value_get_boolean (value);
       break;
+    case PROP_BLUR_OBJECTS:
+      dsretailytics->blur_objects = g_value_get_boolean (value);
+      break;
     case PROP_GPU_DEVICE_ID:
       dsretailytics->gpu_id = g_value_get_uint (value);
-      break;
-    case PROP_BATCH_SIZE:
-      dsretailytics->max_batch_size = g_value_get_uint (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -336,11 +305,11 @@ gst_dsretailytics_get_property (GObject * object, guint prop_id,
     case PROP_PROCESS_FULL_FRAME:
       g_value_set_boolean (value, dsretailytics->process_full_frame);
       break;
+    case PROP_BLUR_OBJECTS:
+      g_value_set_boolean (value, dsretailytics->blur_objects);
+      break;
     case PROP_GPU_DEVICE_ID:
       g_value_set_uint (value, dsretailytics->gpu_id);
-      break;
-    case PROP_BATCH_SIZE:
-      g_value_set_uint (value, dsretailytics->max_batch_size);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -349,32 +318,49 @@ gst_dsretailytics_get_property (GObject * object, guint prop_id,
 }
 
 /**
- * Initialize all resources and start the process thread
+ * Initialize all resources and start the output thread
  */
 static gboolean
 gst_dsretailytics_start (GstBaseTransform * btrans)
 {
   GstDsRetailytics *dsretailytics = GST_DSRETAILYTICS (btrans);
-  std::string nvtx_str;
-  // OpenCV mat containing RGB data
-  cv::Mat * cvmat;
   NvBufSurfaceCreateParams create_params;
   DsRetailyticsInitParams init_params =
       { dsretailytics->processing_width, dsretailytics->processing_height,
-    dsretailytics->process_full_frame };
+    dsretailytics->process_full_frame
+  };
+
+  GstQuery *queryparams = NULL;
+  guint batch_size = 1;
+  int val = -1;
 
   /* Algorithm specific initializations and resource allocation. */
   dsretailytics->dsretailyticslib_ctx = DsRetailyticsCtxInit (&init_params);
 
   GST_DEBUG_OBJECT (dsretailytics, "ctx lib %p \n", dsretailytics->dsretailyticslib_ctx);
 
-  nvtx_str = "GstNvDsRetailytics: UID=" + std::to_string(dsretailytics->unique_id);
-  auto nvtx_deleter = [](nvtxDomainHandle_t d) { nvtxDomainDestroy (d); };
-  std::unique_ptr<nvtxDomainRegistration, decltype(nvtx_deleter)> nvtx_domain_ptr (
-      nvtxDomainCreate(nvtx_str.c_str()), nvtx_deleter);
-
   CHECK_CUDA_STATUS (cudaSetDevice (dsretailytics->gpu_id),
       "Unable to set cuda device");
+
+  cudaDeviceGetAttribute (&val, cudaDevAttrIntegrated, dsretailytics->gpu_id);
+  dsretailytics->is_integrated = val;
+
+  dsretailytics->batch_size = 1;
+  queryparams = gst_nvquery_batch_size_new ();
+  if (gst_pad_peer_query (GST_BASE_TRANSFORM_SINK_PAD (btrans), queryparams)
+      || gst_pad_peer_query (GST_BASE_TRANSFORM_SRC_PAD (btrans), queryparams)) {
+    if (gst_nvquery_batch_size_parse (queryparams, &batch_size)) {
+      dsretailytics->batch_size = batch_size;
+    }
+  }
+  GST_DEBUG_OBJECT (dsretailytics, "Setting batch-size %d \n",
+      dsretailytics->batch_size);
+  gst_query_unref (queryparams);
+
+  if (dsretailytics->process_full_frame && dsretailytics->blur_objects) {
+    GST_ERROR ("Error: does not support blurring while processing full frame");
+    goto error;
+  }
 
   CHECK_CUDA_STATUS (cudaStreamCreate (&dsretailytics->cuda_stream),
       "Could not create cuda stream");
@@ -385,89 +371,52 @@ gst_dsretailytics_start (GstBaseTransform * btrans)
 
   /* An intermediate buffer for NV12/RGBA to BGR conversion  will be
    * required. Can be skipped if custom algorithm can work directly on NV12/RGBA. */
-  create_params.gpuId = dsretailytics->gpu_id;
-  create_params.width = dsretailytics->processing_width;
+  create_params.gpuId  = dsretailytics->gpu_id;
+  create_params.width  = dsretailytics->processing_width;
   create_params.height = dsretailytics->processing_height;
   create_params.size = 0;
   create_params.colorFormat = NVBUF_COLOR_FORMAT_RGBA;
   create_params.layout = NVBUF_LAYOUT_PITCH;
-#ifdef __aarch64__
-  create_params.memType = NVBUF_MEM_DEFAULT;
-#else
-  create_params.memType = NVBUF_MEM_CUDA_UNIFIED;
-#endif
 
-  if (NvBufSurfaceCreate (&dsretailytics->inter_buf, dsretailytics->max_batch_size,
+  if(dsretailytics->is_integrated) {
+    create_params.memType = NVBUF_MEM_DEFAULT;
+  }
+  else {
+    create_params.memType = NVBUF_MEM_CUDA_PINNED;
+  }
+
+  if (NvBufSurfaceCreate (&dsretailytics->inter_buf, 1,
           &create_params) != 0) {
     GST_ERROR ("Error: Could not allocate internal buffer for dsretailytics");
     goto error;
   }
 
-  /* Create process queue and cvmat queue to transfer data between threads.
-   * We will be using this queue to maintain the list of frames/objects
-   * currently given to the algorithm for processing. */
-  dsretailytics->process_queue = g_queue_new ();
-  dsretailytics->cvmat_queue = g_queue_new ();
+  /* Create host memory for storing converted/scaled interleaved RGB data */
+  CHECK_CUDA_STATUS (cudaMallocHost (&dsretailytics->host_rgb_buf,
+          dsretailytics->processing_width * dsretailytics->processing_height *
+          RGB_BYTES_PER_PIXEL), "Could not allocate cuda host buffer");
 
-  /* Push cvmat buffer twice on the cvmat_queue which will handle the
-   * different processing speed between input thread and process thread
-   * cvmat queue is used for getting processed data from the process thread*/
-  for (int i = 0; i < 2; i++) {
-    // CV Mat containing interleaved RGB data.
-    cvmat = new cv::Mat[dsretailytics->max_batch_size];
+  GST_DEBUG_OBJECT (dsretailytics, "allocated cuda buffer %p \n",
+      dsretailytics->host_rgb_buf);
 
-    for (guint j = 0; j < dsretailytics->max_batch_size; j++) {
-      cvmat[j] =
-          cv::Mat (dsretailytics->processing_height, dsretailytics->processing_width,
-          CV_8UC3);
-    }
+  /* CV Mat containing interleaved RGB data. This call does not allocate memory.
+   * It uses host_rgb_buf as data. */
+  dsretailytics->cvmat =
+      new cv::Mat (dsretailytics->processing_height, dsretailytics->processing_width,
+      CV_8UC3, dsretailytics->host_rgb_buf,
+      dsretailytics->processing_width * RGB_BYTES_PER_PIXEL);
 
-    if (!cvmat)
-      goto error;
-
-    g_queue_push_tail (dsretailytics->cvmat_queue, cvmat);
-  }
+  if (!dsretailytics->cvmat)
+    goto error;
 
   GST_DEBUG_OBJECT (dsretailytics, "created CV Mat\n");
 
-  /* Set the NvBufSurfTransform config parameters. */
-  dsretailytics->transform_config_params.compute_mode =
-      NvBufSurfTransformCompute_Default;
-  dsretailytics->transform_config_params.gpu_id = dsretailytics->gpu_id;
-
-  /* Create the intermediate NvBufSurface structure for holding an array of input
-   * NvBufSurfaceParams for batched transforms. */
-  dsretailytics->batch_insurf.surfaceList =
-      new NvBufSurfaceParams[dsretailytics->max_batch_size];
-  dsretailytics->batch_insurf.batchSize = dsretailytics->max_batch_size;
-  dsretailytics->batch_insurf.gpuId = dsretailytics->gpu_id;
-
-  /* Set up the NvBufSurfTransformParams structure for batched transforms. */
-  dsretailytics->transform_params.src_rect =
-      new NvBufSurfTransformRect[dsretailytics->max_batch_size];
-  dsretailytics->transform_params.dst_rect =
-      new NvBufSurfTransformRect[dsretailytics->max_batch_size];
-  dsretailytics->transform_params.transform_flag =
-      NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_SRC |
-      NVBUFSURF_TRANSFORM_CROP_DST;
-  dsretailytics->transform_params.transform_flip = NvBufSurfTransform_None;
-  dsretailytics->transform_params.transform_filter =
-      NvBufSurfTransformInter_Default;
-
-  /* Start a thread which will pop output from the algorithm, form NvDsMeta and
-   * push buffers to the next element. */
-  dsretailytics->process_thread =
-      g_thread_new ("dsretailytics-process-thread", gst_dsretailytics_output_loop,
-      dsretailytics);
-
-  dsretailytics->nvtx_domain = nvtx_domain_ptr.release ();
-
   return TRUE;
 error:
-
-  delete[]dsretailytics->transform_params.src_rect;
-  delete[]dsretailytics->transform_params.dst_rect;
-  delete[]dsretailytics->batch_insurf.surfaceList;
+  if (dsretailytics->host_rgb_buf) {
+    cudaFreeHost (dsretailytics->host_rgb_buf);
+    dsretailytics->host_rgb_buf = NULL;
+  }
 
   if (dsretailytics->cuda_stream) {
     cudaStreamDestroy (dsretailytics->cuda_stream);
@@ -479,55 +428,37 @@ error:
 }
 
 /**
- * Stop the process thread and free up all the resources
+ * Stop the output thread and free up all the resources
  */
 static gboolean
 gst_dsretailytics_stop (GstBaseTransform * btrans)
 {
   GstDsRetailytics *dsretailytics = GST_DSRETAILYTICS (btrans);
-  cv::Mat * cvmat;
-
-  g_mutex_lock (&dsretailytics->process_lock);
-
-  /* Wait till all the items in the queue are handled. */
-  while (!g_queue_is_empty (dsretailytics->process_queue)) {
-    g_cond_wait (&dsretailytics->process_cond, &dsretailytics->process_lock);
-  }
-
-  while (!g_queue_is_empty (dsretailytics->cvmat_queue)) {
-    cvmat = (cv::Mat *) g_queue_pop_head (dsretailytics->cvmat_queue);
-    delete[]cvmat;
-    cvmat = NULL;
-  }
-  dsretailytics->stop = TRUE;
-
-  g_cond_broadcast (&dsretailytics->process_cond);
-  g_mutex_unlock (&dsretailytics->process_lock);
-
-  g_thread_join (dsretailytics->process_thread);
 
   if (dsretailytics->inter_buf)
-    NvBufSurfaceDestroy (dsretailytics->inter_buf);
+    NvBufSurfaceDestroy(dsretailytics->inter_buf);
   dsretailytics->inter_buf = NULL;
 
   if (dsretailytics->cuda_stream)
     cudaStreamDestroy (dsretailytics->cuda_stream);
   dsretailytics->cuda_stream = NULL;
 
-  delete[]dsretailytics->transform_params.src_rect;
-  delete[]dsretailytics->transform_params.dst_rect;
-  delete[]dsretailytics->batch_insurf.surfaceList;
+  delete dsretailytics->cvmat;
+  dsretailytics->cvmat = NULL;
+
+  if (dsretailytics->host_rgb_buf) {
+    cudaFreeHost (dsretailytics->host_rgb_buf);
+    dsretailytics->host_rgb_buf = NULL;
+  }
 
   GST_DEBUG_OBJECT (dsretailytics, "deleted CV Mat \n");
 
-  // Deinit the algorithm library
+  /* Deinit the algorithm library */
   DsRetailyticsCtxDeinit (dsretailytics->dsretailyticslib_ctx);
   dsretailytics->dsretailyticslib_ctx = NULL;
 
   GST_DEBUG_OBJECT (dsretailytics, "ctx lib released \n");
 
-  g_queue_free (dsretailytics->process_queue);
-  g_queue_free (dsretailytics->cvmat_queue);
   return TRUE;
 }
 
@@ -542,8 +473,14 @@ gst_dsretailytics_set_caps (GstBaseTransform * btrans, GstCaps * incaps,
   /* Save the input video information, since this will be required later. */
   gst_video_info_from_caps (&dsretailytics->video_info, incaps);
 
-  CHECK_CUDA_STATUS (cudaSetDevice (dsretailytics->gpu_id),
-      "Unable to set cuda device");
+  if (dsretailytics->blur_objects && !dsretailytics->process_full_frame) {
+    /* requires RGBA format for blurring the objects in opencv */
+     if (dsretailytics->video_info.finfo->format != GST_VIDEO_FORMAT_RGBA) {
+      GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
+          ("input format should be RGBA when using blur-objects property"), (NULL));
+      goto error;
+      }
+  }
 
   return TRUE;
 
@@ -554,19 +491,33 @@ error:
 /**
  * Scale the entire frame to the processing resolution maintaining aspect ratio.
  * Or crop and scale objects to the processing resolution maintaining the aspect
- * ratio and fills data for batched conversation */
+ * ratio. Remove the padding required by hardware and convert from RGBA to RGB
+ * using openCV. These steps can be skipped if the algorithm can work with
+ * padded data and/or can work with RGBA.
+ */
 static GstFlowReturn
-scale_and_fill_data(GstDsRetailytics * dsretailytics,
-    NvBufSurfaceParams * src_frame, NvOSD_RectParams * crop_rect_params,
-    gdouble & ratio, gint input_width, gint input_height)
+get_converted_mat (GstDsRetailytics * dsretailytics, NvBufSurface *input_buf, gint idx,
+    NvOSD_RectParams * crop_rect_params, gdouble & ratio, gint input_width,
+    gint input_height)
 {
+  NvBufSurfTransform_Error err;
+  NvBufSurfTransformConfigParams transform_config_params;
+  NvBufSurfTransformParams transform_params;
+  NvBufSurfTransformRect src_rect;
+  NvBufSurfTransformRect dst_rect;
+  NvBufSurface ip_surf;
+  cv::Mat in_mat;
+  ip_surf = *input_buf;
+
+  ip_surf.numFilled = ip_surf.batchSize = 1;
+  ip_surf.surfaceList = &(input_buf->surfaceList[idx]);
 
   gint src_left = GST_ROUND_UP_2((unsigned int)crop_rect_params->left);
   gint src_top = GST_ROUND_UP_2((unsigned int)crop_rect_params->top);
   gint src_width = GST_ROUND_DOWN_2((unsigned int)crop_rect_params->width);
   gint src_height = GST_ROUND_DOWN_2((unsigned int)crop_rect_params->height);
 
-  // Maintain aspect ratio
+  /* Maintain aspect ratio */
   double hdest = dsretailytics->processing_width * src_height / (double) src_width;
   double wdest = dsretailytics->processing_height * src_width / (double) src_height;
   guint dest_width, dest_height;
@@ -579,214 +530,175 @@ scale_and_fill_data(GstDsRetailytics * dsretailytics,
     dest_height = dsretailytics->processing_height;
   }
 
-  // Calculate scaling ratio while maintaining aspect ratio
-  ratio = MIN (1.0 * dest_width / src_width, 1.0 * dest_height / src_height);
-
-  if ((crop_rect_params->width == 0) || (crop_rect_params->height == 0)) {
-    GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
-        ("%s:crop_rect_params dimensions are zero", __func__), (NULL));
-    return GST_FLOW_ERROR;
-  }
-#ifdef __aarch64__
-  if (ratio <= 1.0 / 16 || ratio >= 16.0) {
-    // Currently cannot scale by ratio > 16 or < 1/16 for Jetson
-    return GST_FLOW_ERROR;
-  }
-#endif
-
-  //Memset the memory
-  NvBufSurfaceMemSet (dsretailytics->inter_buf, dsretailytics->batch_insurf.numFilled, 0,
-      0);
-
-  /* We will first convert only the Region of Interest (the entire frame or the
-   * object bounding box) to RGB and then scale the converted RGB frame to
-   * processing resolution. */
-  GST_DEBUG_OBJECT (dsretailytics, "Scaling and converting input buffer\n");
-
-  /* Create temporary src and dest surfaces for NvBufSurfTransform API. */
-  dsretailytics->batch_insurf.surfaceList[dsretailytics->batch_insurf.numFilled] = *src_frame;
-
-  /* Set the source ROI. Could be entire frame or an object. */
-  dsretailytics->transform_params.src_rect[dsretailytics->batch_insurf.numFilled] = {
-  (guint) src_top, (guint) src_left, (guint) src_width, (guint) src_height};
-  /* Set the dest ROI. Could be the entire destination frame or part of it to
-   * maintain aspect ratio. */
-  dsretailytics->transform_params.dst_rect[dsretailytics->batch_insurf.numFilled] = {
-  0, 0, dest_width, dest_height};
-
-  dsretailytics->batch_insurf.numFilled++;
-
-  return GST_FLOW_OK;
-}
-
-static gboolean
-convert_batch_and_push_to_process_thread (GstDsRetailytics * dsretailytics,
-    GstDsRetailyticsBatch * batch)
-{
-
-  NvBufSurfTransform_Error err;
-  NvBufSurfTransformConfigParams transform_config_params;
-  std::string nvtx_str;
-  cv::Mat in_mat;
-
-  // Configure transform session parameters for the transformation
+  /* Configure transform session parameters for the transformation */
   transform_config_params.compute_mode = NvBufSurfTransformCompute_Default;
   transform_config_params.gpu_id = dsretailytics->gpu_id;
   transform_config_params.cuda_stream = dsretailytics->cuda_stream;
 
+  /* Set the transform session parameters for the conversions executed in this
+   * thread. */
   err = NvBufSurfTransformSetSessionParams (&transform_config_params);
   if (err != NvBufSurfTransformError_Success) {
     GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
-        ("NvBufSurfTransformSetSessionParams failed with error %d", err),
-        (NULL));
-    return FALSE;
+        ("NvBufSurfTransformSetSessionParams failed with error %d", err), (NULL));
+    goto error;
   }
 
-  nvtxEventAttributes_t eventAttrib = {0};
-  eventAttrib.version = NVTX_VERSION;
-  eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-  eventAttrib.colorType = NVTX_COLOR_ARGB;
-  eventAttrib.color = 0xFFFF0000;
-  eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
-  nvtx_str = "convert_buf batch_num=" + std::to_string(dsretailytics->current_batch_num);
-  eventAttrib.message.ascii = nvtx_str.c_str();
+  /* Calculate scaling ratio while maintaining aspect ratio */
+  ratio = MIN (1.0 * dest_width/ src_width, 1.0 * dest_height / src_height);
 
-  nvtxDomainRangePushEx(dsretailytics->nvtx_domain, &eventAttrib);
-
-  /* Batched tranformation. */
-  err = NvBufSurfTransform (&dsretailytics->batch_insurf, dsretailytics->inter_buf,
-      &dsretailytics->transform_params);
-
-  nvtxDomainRangePop (dsretailytics->nvtx_domain);
-
-  if (err != NvBufSurfTransformError_Success) {
+  if ((crop_rect_params->width == 0) || (crop_rect_params->height == 0)) {
     GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
-        ("NvBufSurfTransform failed with error %d while converting buffer",
-            err), (NULL));
-    return FALSE;
+        ("%s:crop_rect_params dimensions are zero",__func__), (NULL));
+    goto error;
   }
-
-  g_mutex_lock (&dsretailytics->process_lock);
-
-  /* Wait if cvmat queue is empty. */
-  while (g_queue_is_empty (dsretailytics->cvmat_queue)) {
-    g_cond_wait (&dsretailytics->cvmat_cond, &dsretailytics->process_lock);
-  }
-
-  /* Pop a buffer from the element's cvmat queue. */
-  batch->cvmat = (cv::Mat *) g_queue_pop_head (dsretailytics->cvmat_queue);
-
-  g_mutex_unlock (&dsretailytics->process_lock);
-
-  // Use openCV to remove padding and convert RGBA to BGR. Can be skipped if
-  // algorithm can handle padded RGBA data.
-  for (guint i = 0; i < dsretailytics->batch_insurf.numFilled; i++) {
-    // Map the buffer so that it can be accessed by CPU
-    if (NvBufSurfaceMap (dsretailytics->inter_buf, i, 0, NVBUF_MAP_READ) != 0) {
-      GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
-          ("%s:buffer map to be accessed by CPU failed", __func__), (NULL));
-      return FALSE;
-    }
-    // sync mapped data for CPU access
-    NvBufSurfaceSyncForCpu (dsretailytics->inter_buf, i,0);
-
-    in_mat =
-        cv::Mat (dsretailytics->processing_height, dsretailytics->processing_width,
-        CV_8UC4,dsretailytics->inter_buf->surfaceList[i].mappedAddr.addr[0],
-      dsretailytics->inter_buf->surfaceList[i].pitch);
-
-#if (CV_MAJOR_VERSION >= 4)
-  cv::cvtColor (in_mat, batch->cvmat[i], cv::COLOR_RGBA2BGR);
-#else
-  cv::cvtColor (in_mat, batch->cvmat[i], CV_RGBA2BGR);
-#endif
-
-#ifdef DSRETAILYTICS_DEBUG
-  static guint cnt = 0;
-  cv::imwrite("out_" + std::to_string (cnt) + ".jpeg", batch->cvmat[i]);
-  cnt++;
-#endif
-
-    if (NvBufSurfaceUnMap (dsretailytics->inter_buf, i,0)) {
-      GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
-        ("%s:buffer unmap to be accessed by CPU failed", __func__), (NULL));
-      return FALSE;
-    }
 
 #ifdef __aarch64__
-  // To use the converted buffer in CUDA, create an EGLImage and then use
-  // CUDA-EGL interop APIs
-  if (USE_EGLIMAGE) {
-    if (NvBufSurfaceMapEglImage (dsretailytics->inter_buf, 0) != 0) {
-      GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
-        ("%s:buffer map eglimage failed", __func__), (NULL));
-      return FALSE;
-    }
-    // dsretailytics->inter_buf->surfaceList[0].mappedAddr.eglImage
-    // Use interop APIs cuGraphicsEGLRegisterImage and
-    // cuGraphicsResourceGetMappedEglFrame to access the buffer in CUDA
-
-    // Destroy the EGLImage
-    NvBufSurfaceUnMapEglImage (dsretailytics->inter_buf, 0);
+  if (ratio <= 1.0 / 16 || ratio >= 16.0) {
+    /* Currently cannot scale by ratio > 16 or < 1/16 for Jetson */
+    goto error;
   }
+#endif
+  /* Set the transform ROIs for source and destination */
+  src_rect = {(guint)src_top, (guint)src_left, (guint)src_width, (guint)src_height};
+  dst_rect = {0, 0, (guint)dest_width, (guint)dest_height};
+
+  /* Set the transform parameters */
+  transform_params.src_rect = &src_rect;
+  transform_params.dst_rect = &dst_rect;
+  transform_params.transform_flag =
+    NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_SRC |
+      NVBUFSURF_TRANSFORM_CROP_DST;
+  transform_params.transform_filter = NvBufSurfTransformInter_Default;
+
+  /* Memset the memory */
+  NvBufSurfaceMemSet (dsretailytics->inter_buf, 0, 0, 0);
+
+  GST_DEBUG_OBJECT (dsretailytics, "Scaling and converting input buffer\n");
+
+  /* Transformation scaling+format conversion if any. */
+  err = NvBufSurfTransform (&ip_surf, dsretailytics->inter_buf, &transform_params);
+  if (err != NvBufSurfTransformError_Success) {
+    GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
+        ("NvBufSurfTransform failed with error %d while converting buffer", err),
+        (NULL));
+    goto error;
+  }
+  /* Map the buffer so that it can be accessed by CPU */
+  if (NvBufSurfaceMap (dsretailytics->inter_buf, 0, 0, NVBUF_MAP_READ) != 0){
+    goto error;
+  }
+  if(dsretailytics->inter_buf->memType == NVBUF_MEM_SURFACE_ARRAY) {
+    /* Cache the mapped data for CPU access */
+    NvBufSurfaceSyncForCpu (dsretailytics->inter_buf, 0, 0);
+  }
+
+  /* Use openCV to remove padding and convert RGBA to BGR. Can be skipped if
+   * algorithm can handle padded RGBA data. */
+  in_mat =
+      cv::Mat (dsretailytics->processing_height, dsretailytics->processing_width,
+      CV_8UC4, dsretailytics->inter_buf->surfaceList[0].mappedAddr.addr[0],
+      dsretailytics->inter_buf->surfaceList[0].pitch);
+
+#if (CV_MAJOR_VERSION >= 4)
+  cv::cvtColor (in_mat, *dsretailytics->cvmat, cv::COLOR_RGBA2BGR);
+#else
+  cv::cvtColor (in_mat, *dsretailytics->cvmat, CV_RGBA2BGR);
+#endif
+
+    if (NvBufSurfaceUnMap (dsretailytics->inter_buf, 0, 0)){
+      goto error;
+    }
+
+  if(dsretailytics->is_integrated) {
+#ifdef __aarch64__
+    /* To use the converted buffer in CUDA, create an EGLImage and then use
+    * CUDA-EGL interop APIs */
+    if (USE_EGLIMAGE) {
+      if (NvBufSurfaceMapEglImage (dsretailytics->inter_buf, 0) !=0 ) {
+        goto error;
+      }
+
+      /* dsretailytics->inter_buf->surfaceList[0].mappedAddr.eglImage
+      * Use interop APIs cuGraphicsEGLRegisterImage and
+      * cuGraphicsResourceGetMappedEglFrame to access the buffer in CUDA */
+
+      /* Destroy the EGLImage */
+      NvBufSurfaceUnMapEglImage (dsretailytics->inter_buf, 0);
+    }
 #endif
   }
 
-  /* Push the batch info structure in the processing queue and notify the process
-   * thread that a new batch has been queued. */
-  g_mutex_lock (&dsretailytics->process_lock);
+  /* We will first convert only the Region of Interest (the entire frame or the
+   * object bounding box) to RGB and then scale the converted RGB frame to
+   * processing resolution. */
+  return GST_FLOW_OK;
 
-  g_queue_push_tail (dsretailytics->process_queue, batch);
-  g_cond_broadcast (&dsretailytics->process_cond);
+error:
+  return GST_FLOW_ERROR;
+}
 
-  g_mutex_unlock (&dsretailytics->process_lock);
+/*
+ * Blur the detected objects when processing in object mode (full-frame=0)
+ */
+static GstFlowReturn
+blur_objects (GstDsRetailytics * dsretailytics, gint idx,
+    NvOSD_RectParams * crop_rect_params, cv::Mat in_mat)
+{
+  cv::Rect crop_rect;
 
-  return TRUE;
+  if ((crop_rect_params->width == 0) || (crop_rect_params->height == 0)) {
+    GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
+        ("%s:crop_rect_params dimensions are zero",__func__), (NULL));
+    return GST_FLOW_ERROR;
+  }
+
+/* rectangle for cropped objects */
+  crop_rect = cv::Rect (crop_rect_params->left, crop_rect_params->top,
+  crop_rect_params->width, crop_rect_params->height);
+
+/* apply gaussian blur to the detected objects */
+  GaussianBlur(in_mat(crop_rect), in_mat(crop_rect), cv::Size(15,15), 4);
+
+  return GST_FLOW_OK;
 }
 
 /**
  * Called when element recieves an input buffer from upstream element.
  */
 static GstFlowReturn
-gst_dsretailytics_submit_input_buffer (GstBaseTransform * btrans,
-    gboolean discont, GstBuffer * inbuf)
+gst_dsretailytics_transform_ip (GstBaseTransform * btrans, GstBuffer * inbuf)
 {
   GstDsRetailytics *dsretailytics = GST_DSRETAILYTICS (btrans);
   GstMapInfo in_map_info;
-  NvBufSurface *in_surf;
-  GstDsRetailyticsBatch *buf_push_batch;
-  GstFlowReturn flow_ret;
-  std::string nvtx_str;
-  std::unique_ptr < GstDsRetailyticsBatch > batch = nullptr;
-
-  NvDsBatchMeta *batch_meta = NULL;
-  guint i = 0;
+  GstFlowReturn flow_ret = GST_FLOW_ERROR;
   gdouble scale_ratio = 1.0;
-  guint num_filled = 0;
+  DsRetailyticsOutput *output;
 
-  dsretailytics->current_batch_num++;
+  NvBufSurface *surface = NULL;
+  NvDsBatchMeta *batch_meta = NULL;
+  NvDsFrameMeta *frame_meta = NULL;
+  NvDsMetaList * l_frame = NULL;
+  guint i = 0;
 
-  nvtxEventAttributes_t eventAttrib = {0};
-  eventAttrib.version = NVTX_VERSION;
-  eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-  eventAttrib.colorType = NVTX_COLOR_ARGB;
-  eventAttrib.color = 0xFFFF0000;
-  eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
-  nvtx_str = "buffer_process batch_num=" + std::to_string(dsretailytics->current_batch_num);
-  eventAttrib.message.ascii = nvtx_str.c_str();
-  nvtxRangeId_t buf_process_range = nvtxDomainRangeStartEx(dsretailytics->nvtx_domain, &eventAttrib);
+  dsretailytics->frame_num++;
+  CHECK_CUDA_STATUS (cudaSetDevice (dsretailytics->gpu_id),
+      "Unable to set cuda device");
 
   memset (&in_map_info, 0, sizeof (in_map_info));
-
-  /* Map the buffer contents and get the pointer to NvBufSurface. */
   if (!gst_buffer_map (inbuf, &in_map_info, GST_MAP_READ)) {
-    GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
-        ("%s:gst buffer map to get pointer to NvBufSurface failed", __func__), (NULL));
-    return GST_FLOW_ERROR;
+    g_print ("Error: Failed to map gst buffer\n");
+    goto error;
   }
-  in_surf = (NvBufSurface *) in_map_info.data;
 
   nvds_set_input_system_timestamp (inbuf, GST_ELEMENT_NAME (dsretailytics));
+  surface = (NvBufSurface *) in_map_info.data;
+  GST_DEBUG_OBJECT (dsretailytics,
+      "Processing Frame %" G_GUINT64_FORMAT " Surface %p\n",
+      dsretailytics->frame_num, surface);
+
+  if (CHECK_NVDS_MEMORY_AND_GPUID (dsretailytics, surface))
+    goto error;
 
   batch_meta = gst_buffer_get_nvds_batch_meta (inbuf);
   if (batch_meta == nullptr) {
@@ -794,70 +706,100 @@ gst_dsretailytics_submit_input_buffer (GstBaseTransform * btrans,
         ("NvDsBatchMeta not found for input buffer."), (NULL));
     return GST_FLOW_ERROR;
   }
-  num_filled = batch_meta->num_frames_in_batch;
 
   if (dsretailytics->process_full_frame) {
-    for (guint i = 0; i < num_filled; i++) {
+    for (l_frame = batch_meta->frame_meta_list; l_frame != NULL;
+      l_frame = l_frame->next)
+    {
+      frame_meta = (NvDsFrameMeta *) (l_frame->data);
       NvOSD_RectParams rect_params;
 
-      // Scale the entire frame to processing resolution
+      /* Scale the entire frame to processing resolution */
       rect_params.left = 0;
       rect_params.top = 0;
-      rect_params.width = in_surf->surfaceList[i].width;
-      rect_params.height = in_surf->surfaceList[i].height;
+      rect_params.width = dsretailytics->video_info.width;
+      rect_params.height = dsretailytics->video_info.height;
 
-      // Scale the frame maintaining aspect ratio
-      if (scale_and_fill_data (dsretailytics, in_surf->surfaceList + i,
-              &rect_params, scale_ratio, dsretailytics->video_info.width,
-              dsretailytics->video_info.height) != GST_FLOW_OK) {
+      /* Scale and convert the frame */
+      if (get_converted_mat (dsretailytics, surface, i, &rect_params,
+            scale_ratio, dsretailytics->video_info.width,
+            dsretailytics->video_info.height) != GST_FLOW_OK) {
         goto error;
       }
 
-      if (batch == nullptr) {
-        batch.reset (new GstDsRetailyticsBatch);
-        batch->push_buffer = FALSE;
-        batch->inbuf = inbuf;
-        batch->inbuf_batch_num = dsretailytics->current_batch_num;
-      }
+      /* Process to get the output */
+      output =
+          DsRetailyticsProcess (dsretailytics->dsretailyticslib_ctx,
+          dsretailytics->cvmat->data);
+      /* Attach the metadata for the full frame */
+      attach_metadata_full_frame (dsretailytics, frame_meta, scale_ratio, output, i);
+      i++;
+      free (output);
+    }
 
-      /* Adding a frame to the current batch. Set the frames members. */
-      GstDsRetailyticsFrame frame;
-      frame.scale_ratio_x = scale_ratio;
-      frame.scale_ratio_y = scale_ratio;
-      frame.obj_meta = nullptr;
-      frame.frame_meta =
-          nvds_get_nth_frame_meta (batch_meta->frame_meta_list, i);
-      frame.frame_num = frame.frame_meta->frame_num;
-      frame.batch_index = i;
-      frame.input_surf_params = in_surf->surfaceList + i;
-      batch->frames.push_back (frame);
+  } else {
+    /* Using object crops as input to the algorithm. The objects are detected by
+     * the primary detector */
+    NvDsMetaList * l_obj = NULL;
+    NvDsObjectMeta *obj_meta = NULL;
 
-      // Set the transform session parameters for the conversions executed in this
-      // thread.
-      if (batch->frames.size () == dsretailytics->max_batch_size || i == num_filled) {
-        if (!convert_batch_and_push_to_process_thread (dsretailytics, batch.get ())) {
+    if(!dsretailytics->is_integrated) {
+      if (dsretailytics->blur_objects) {
+        if (!(surface->memType == NVBUF_MEM_CUDA_UNIFIED || surface->memType == NVBUF_MEM_CUDA_PINNED)){
+          GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
+              ("%s:need NVBUF_MEM_CUDA_UNIFIED or NVBUF_MEM_CUDA_PINNED memory for opencv blurring",__func__), (NULL));
           return GST_FLOW_ERROR;
         }
-        /* Batch submitted. Set batch to nullptr so that a new GstDsRetailyticsBatch
-         * structure can be allocated if required. */
-        batch.release ();
-        dsretailytics->batch_insurf.numFilled = 0;
       }
     }
-  } else {
-    // Using object crops as input to the algorithm. The objects are detected by
-    // the primary detector
-    NvDsFrameMeta *frame_meta = NULL;
-    NvDsMetaList *l_frame = NULL;
-    NvDsObjectMeta *obj_meta = NULL;
-    NvDsMetaList *l_obj = NULL;
 
     for (l_frame = batch_meta->frame_meta_list; l_frame != NULL;
-        l_frame = l_frame->next) {
+      l_frame = l_frame->next)
+    {
       frame_meta = (NvDsFrameMeta *) (l_frame->data);
+      cv::Mat in_mat;
+
+      if (dsretailytics->blur_objects) {
+        /* Map the buffer so that it can be accessed by CPU */
+        if (surface->surfaceList[frame_meta->batch_id].mappedAddr.addr[0] == NULL){
+          if (NvBufSurfaceMap (surface, frame_meta->batch_id, 0, NVBUF_MAP_READ_WRITE) != 0){
+            GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
+                ("%s:buffer map to be accessed by CPU failed", __func__), (NULL));
+            return GST_FLOW_ERROR;
+          }
+        }
+
+        /* Cache the mapped data for CPU access */
+        if(dsretailytics->inter_buf->memType == NVBUF_MEM_SURFACE_ARRAY)
+          NvBufSurfaceSyncForCpu (surface, frame_meta->batch_id, 0);
+
+        in_mat =
+            cv::Mat (surface->surfaceList[frame_meta->batch_id].planeParams.height[0],
+            surface->surfaceList[frame_meta->batch_id].planeParams.width[0], CV_8UC4,
+            surface->surfaceList[frame_meta->batch_id].mappedAddr.addr[0],
+            surface->surfaceList[frame_meta->batch_id].planeParams.pitch[0]);
+      }
+
       for (l_obj = frame_meta->obj_meta_list; l_obj != NULL;
-          l_obj = l_obj->next) {
+          l_obj = l_obj->next)
+      {
         obj_meta = (NvDsObjectMeta *) (l_obj->data);
+
+        if (dsretailytics->blur_objects) {
+          /* gaussian blur the detected objects using opencv */
+          if (blur_objects (dsretailytics, frame_meta->batch_id,
+            &obj_meta->rect_params, in_mat) != GST_FLOW_OK) {
+          /* Error in blurring, skip processing on object. */
+            GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
+            ("blurring the object failed"), (NULL));
+            if (NvBufSurfaceUnMap (surface, frame_meta->batch_id, 0)){
+              GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
+                ("%s:buffer unmap to be accessed by CPU failed", __func__), (NULL));
+            }
+            return GST_FLOW_ERROR;
+          }
+          continue;
+        }
 
         /* Should not process on objects smaller than MIN_INPUT_OBJECT_WIDTH x MIN_INPUT_OBJECT_HEIGHT
          * since it will cause hardware scaling issues. */
@@ -865,112 +807,61 @@ gst_dsretailytics_submit_input_buffer (GstBaseTransform * btrans,
             obj_meta->rect_params.height < MIN_INPUT_OBJECT_HEIGHT)
           continue;
 
-        // Crop and scale the object maintainig aspect ratio
-        if (scale_and_fill_data (dsretailytics,
-                in_surf->surfaceList + frame_meta->batch_id,
-                &obj_meta->rect_params, scale_ratio,
-                dsretailytics->video_info.width,
-                dsretailytics->video_info.height) != GST_FLOW_OK) {
-          // Error in conversion, skip processing on object. */
+        /* Crop and scale the object */
+        if (get_converted_mat (dsretailytics,
+              surface, frame_meta->batch_id, &obj_meta->rect_params,
+              scale_ratio, dsretailytics->video_info.width,
+              dsretailytics->video_info.height) != GST_FLOW_OK) {
+          /* Error in conversion, skip processing on object. */
           continue;
         }
 
-        if (batch == nullptr) {
-          batch.reset (new GstDsRetailyticsBatch);
-          batch->push_buffer = FALSE;
-          batch->inbuf = inbuf;
-          batch->inbuf_batch_num = dsretailytics->current_batch_num;
-          batch->nvtx_complete_buf_range = buf_process_range;
-        }
+        /* Process the object crop to obtain label */
+        output = DsRetailyticsProcess (dsretailytics->dsretailyticslib_ctx,
+            dsretailytics->cvmat->data);
 
-        /* Adding a frame to the current batch. Set the frames members. */
-        GstDsRetailyticsFrame frame;
-        frame.scale_ratio_x = scale_ratio;
-        frame.scale_ratio_y = scale_ratio;
-        frame.obj_meta = obj_meta;
-        frame.frame_meta =
-            nvds_get_nth_frame_meta (batch_meta->frame_meta_list, i);
-        frame.frame_num = frame.frame_meta->frame_num;
-        frame.batch_index = i;
-        frame.input_surf_params = in_surf->surfaceList + i;
-        batch->frames.push_back (frame);
+        /* Attach labels for the object */
+        attach_metadata_object (dsretailytics, obj_meta, output);
 
-        i++;
+        free (output);
+      }
 
-        // Convert batch and push to process thread
-        if (batch->frames.size () == dsretailytics->max_batch_size
-            || i == num_filled) {
-          if (!convert_batch_and_push_to_process_thread (dsretailytics,
-                  batch.get ())) {
-            return GST_FLOW_ERROR;
-          }
-          /* Batch submitted. Set batch to nullptr so that a new GstDsRetailyticsBatch
-           * structure can be allocated if required. */
-          i = 0;
-          batch.release ();
-          dsretailytics->batch_insurf.numFilled = 0;
-        }
+      if (dsretailytics->blur_objects) {
+      /* Cache the mapped data for device access */
+        if(dsretailytics->inter_buf->memType == NVBUF_MEM_SURFACE_ARRAY)
+          NvBufSurfaceSyncForDevice (surface, frame_meta->batch_id, 0);
+
+#ifdef DSRETAILYTICS_DEBUG
+        /* Use openCV to remove padding and convert RGBA to BGR. Can be skipped if
+        * algorithm can handle padded RGBA data. */
+#if (CV_MAJOR_VERSION >= 4)
+        cv::cvtColor (in_mat, *dsretailytics->cvmat, cv::COLOR_RGBA2BGR);
+#else
+        cv::cvtColor (in_mat, *dsretailytics->cvmat, CV_RGBA2BGR);
+#endif
+        /* used to dump the converted mat to files for debug */
+        static guint cnt = 0;
+        cv::imwrite("out_" + std::to_string (cnt) + ".jpeg", *dsretailytics->cvmat);
+        cnt++;
+#endif
       }
     }
   }
-    /* Submit a non-full batch. */
-  if (batch) {
-    if (!convert_batch_and_push_to_process_thread (dsretailytics, batch.get ())) {
-      return GST_FLOW_ERROR;
-    }
-    batch.release ();
-    dsretailytics->batch_insurf.numFilled = 0;
-  }
-
-  nvtxDomainRangeEnd(dsretailytics->nvtx_domain, buf_process_range);
-
-  /* Queue a push buffer batch. This batch is not inferred. This batch is to
-   * signal the process thread that there are no more batches
-   * belonging to this input buffer and this GstBuffer can be pushed to
-   * downstream element once all the previous processing is done. */
-  buf_push_batch = new GstDsRetailyticsBatch;
-  buf_push_batch->inbuf = inbuf;
-  buf_push_batch->push_buffer = TRUE;
-  buf_push_batch->nvtx_complete_buf_range = buf_process_range;
-
-  g_mutex_lock (&dsretailytics->process_lock);
-  /* Check if this is a push buffer or event marker batch. If yes, no need to
-   * queue the input for inferencing. */
-  if (buf_push_batch->push_buffer) {
-    /* Push the batch info structure in the processing queue and notify the
-     * process thread that a new batch has been queued. */
-    g_queue_push_tail (dsretailytics->process_queue, buf_push_batch);
-    g_cond_broadcast (&dsretailytics->process_cond);
-  }
-  g_mutex_unlock (&dsretailytics->process_lock);
-
   flow_ret = GST_FLOW_OK;
 
 error:
+
+  nvds_set_output_system_timestamp (inbuf, GST_ELEMENT_NAME (dsretailytics));
   gst_buffer_unmap (inbuf, &in_map_info);
   return flow_ret;
-}
-
-/**
- * If submit_input_buffer is implemented, it is mandatory to implement
- * generate_output. Buffers are not pushed to the downstream element from here.
- * Return the GstFlowReturn value of the latest pad push so that any error might
- * be caught by the application.
- */
-static GstFlowReturn
-gst_dsretailytics_generate_output (GstBaseTransform * btrans, GstBuffer ** outbuf)
-{
-  GstDsRetailytics *dsretailytics = GST_DSRETAILYTICS (btrans);
-  return dsretailytics->last_flow_ret;
 }
 
 /**
  * Attach metadata for the full frame. We will be adding a new metadata.
  */
 static void
-attach_metadata_full_frame (GstDsRetailytics * dsretailytics,
-    NvDsFrameMeta * frame_meta, gdouble scale_ratio, DsRetailyticsOutput * output,
-    guint batch_id)
+attach_metadata_full_frame (GstDsRetailytics * dsretailytics, NvDsFrameMeta *frame_meta,
+    gdouble scale_ratio, DsRetailyticsOutput * output, guint batch_id)
 {
   NvDsBatchMeta *batch_meta = frame_meta->base_meta.batch_meta;
   NvDsObjectMeta *object_meta = NULL;
@@ -979,27 +870,27 @@ attach_metadata_full_frame (GstDsRetailytics * dsretailytics,
 
   for (gint i = 0; i < output->numObjects; i++) {
     DsRetailyticsObject *obj = &output->object[i];
-    object_meta = nvds_acquire_obj_meta_from_pool (batch_meta);
+    object_meta = nvds_acquire_obj_meta_from_pool(batch_meta);
     NvOSD_RectParams & rect_params = object_meta->rect_params;
     NvOSD_TextParams & text_params = object_meta->text_params;
 
-    // Assign bounding box coordinates
+    /* Assign bounding box coordinates */
     rect_params.left = obj->left;
     rect_params.top = obj->top;
     rect_params.width = obj->width;
     rect_params.height = obj->height;
 
-    // Semi-transparent yellow background
+    /* Semi-transparent yellow background */
     rect_params.has_bg_color = 0;
     rect_params.bg_color = (NvOSD_ColorParams) {
     1, 1, 0, 0.4};
-    // Red border of width 6
+    /* Red border of width 6 */
     rect_params.border_width = 3;
     rect_params.border_color = (NvOSD_ColorParams) {
     1, 0, 0, 1};
 
-    // Scale the bounding boxes proportionally based on how the object/frame was
-    // scaled during input
+    /* Scale the bounding boxes proportionally based on how the object/frame was
+     * scaled during input */
     rect_params.left /= scale_ratio;
     rect_params.top /= scale_ratio;
     rect_params.width /= scale_ratio;
@@ -1011,22 +902,23 @@ attach_metadata_full_frame (GstDsRetailytics * dsretailytics,
 
     object_meta->object_id = UNTRACKED_OBJECT_ID;
     g_strlcpy (object_meta->obj_label, obj->label, MAX_LABEL_SIZE);
-    // display_text required heap allocated memory
+    /* display_text required heap allocated memory */
     text_params.display_text = g_strdup (obj->label);
-    // Display text above the left top corner of the object
+    /* Display text above the left top corner of the object */
     text_params.x_offset = rect_params.left;
     text_params.y_offset = rect_params.top - 10;
-    // Set black background for the text
+    /* Set black background for the text */
     text_params.set_bg_clr = 1;
     text_params.text_bg_clr = (NvOSD_ColorParams) {
     0, 0, 0, 1};
-    // Font face, size and color
+    /* Font face, size and color */
     text_params.font_params.font_name = font_name;
     text_params.font_params.font_size = 11;
     text_params.font_params.font_color = (NvOSD_ColorParams) {
     1, 1, 1, 1};
 
-    nvds_add_obj_meta_to_frame (frame_meta, object_meta, NULL);
+    nvds_add_obj_meta_to_frame(frame_meta, object_meta, NULL);
+    frame_meta->bInferDone = TRUE;
   }
 }
 
@@ -1043,14 +935,14 @@ attach_metadata_object (GstDsRetailytics * dsretailytics, NvDsObjectMeta * obj_m
   NvDsBatchMeta *batch_meta = obj_meta->base_meta.batch_meta;
 
   NvDsClassifierMeta *classifier_meta =
-      nvds_acquire_classifier_meta_from_pool (batch_meta);
+    nvds_acquire_classifier_meta_from_pool (batch_meta);
 
   classifier_meta->unique_component_id = dsretailytics->unique_id;
 
   NvDsLabelInfo *label_info =
-      nvds_acquire_label_info_meta_from_pool (batch_meta);
+    nvds_acquire_label_info_meta_from_pool (batch_meta);
   g_strlcpy (label_info->result_label, output->object[0].label, MAX_LABEL_SIZE);
-  nvds_add_label_info_meta_to_classifier (classifier_meta, label_info);
+  nvds_add_label_info_meta_to_classifier(classifier_meta, label_info);
   nvds_add_classifier_meta_to_object (obj_meta, classifier_meta);
 
   nvds_acquire_meta_lock (batch_meta);
@@ -1058,157 +950,29 @@ attach_metadata_object (GstDsRetailytics * dsretailytics, NvDsObjectMeta * obj_m
   NvOSD_RectParams & rect_params = obj_meta->rect_params;
 
   /* Below code to display the result */
-  // Set black background for the text
-  // display_text required heap allocated memory
+  /* Set black background for the text
+   * display_text required heap allocated memory */
   if (text_params.display_text) {
     gchar *conc_string = g_strconcat (text_params.display_text, " ",
         output->object[0].label, NULL);
     g_free (text_params.display_text);
     text_params.display_text = conc_string;
   } else {
-    // Display text above the left top corner of the object
+    /* Display text above the left top corner of the object */
     text_params.x_offset = rect_params.left;
     text_params.y_offset = rect_params.top - 10;
     text_params.display_text = g_strdup (output->object[0].label);
-    // Font face, size and color
-    text_params.font_params.font_name = (char *) "Serif";
+    /* Font face, size and color */
+    text_params.font_params.font_name = (char *)"Serif";
     text_params.font_params.font_size = 11;
     text_params.font_params.font_color = (NvOSD_ColorParams) {
     1, 1, 1, 1};
-    // Set black background for the text
+    /* Set black background for the text */
     text_params.set_bg_clr = 1;
     text_params.text_bg_clr = (NvOSD_ColorParams) {
     0, 0, 0, 1};
   }
   nvds_release_meta_lock (batch_meta);
-}
-
-/**
- * Output loop used to pop output from processing thread, attach the output to the
- * buffer in form of NvDsMeta and push the buffer to downstream element.
- */
-static gpointer
-gst_dsretailytics_output_loop (gpointer data)
-{
-  GstDsRetailytics *dsretailytics = GST_DSRETAILYTICS (data);
-  DsRetailyticsOutput *output;
-  NvDsObjectMeta *obj_meta = NULL;
-  gdouble scale_ratio = 1.0;
-
-  nvtxEventAttributes_t eventAttrib = {0};
-  eventAttrib.version = NVTX_VERSION;
-  eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-  eventAttrib.colorType = NVTX_COLOR_ARGB;
-  eventAttrib.color = 0xFFFF0000;
-  eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
-  std::string nvtx_str;
-
-  nvtx_str =
-      "gst-dsretailytics_output-loop_uid=" + std::to_string (dsretailytics->unique_id);
-
-  g_mutex_lock (&dsretailytics->process_lock);
-
-  /* Run till signalled to stop. */
-  while (!dsretailytics->stop) {
-    std::unique_ptr < GstDsRetailyticsBatch > batch = nullptr;
-
-    /* Wait if processing queue is empty. */
-    if (g_queue_is_empty (dsretailytics->process_queue)) {
-      g_cond_wait (&dsretailytics->process_cond, &dsretailytics->process_lock);
-      continue;
-    }
-
-    /* Pop a batch from the element's process queue. */
-    batch.reset ((GstDsRetailyticsBatch *)
-        g_queue_pop_head (dsretailytics->process_queue));
-    g_cond_broadcast (&dsretailytics->process_cond);
-
-    /* Event marker used for synchronization. No need to process further. */
-    if (batch->event_marker) {
-      continue;
-    }
-
-    g_mutex_unlock (&dsretailytics->process_lock);
-
-    /* Need to only push buffer to downstream element. This batch was not
-     * actually submitted for inferencing. */
-    if (batch->push_buffer) {
-      nvtxDomainRangeEnd(dsretailytics->nvtx_domain, batch->nvtx_complete_buf_range);
-
-      nvds_set_output_system_timestamp (batch->inbuf,
-          GST_ELEMENT_NAME (dsretailytics));
-
-      GstFlowReturn flow_ret =
-          gst_pad_push (GST_BASE_TRANSFORM_SRC_PAD (dsretailytics),
-          batch->inbuf);
-      if (dsretailytics->last_flow_ret != flow_ret) {
-        switch (flow_ret) {
-            /* Signal the application for pad push errors by posting a error message
-             * on the pipeline bus. */
-          case GST_FLOW_ERROR:
-          case GST_FLOW_NOT_LINKED:
-          case GST_FLOW_NOT_NEGOTIATED:
-            GST_ELEMENT_ERROR (dsretailytics, STREAM, FAILED,
-                ("Internal data stream error."),
-                ("streaming stopped, reason %s (%d)",
-                    gst_flow_get_name (flow_ret), flow_ret));
-            break;
-          default:
-            break;
-        }
-      }
-      dsretailytics->last_flow_ret = flow_ret;
-      g_mutex_lock (&dsretailytics->process_lock);
-      continue;
-    }
-
-    nvtx_str = "dequeueOutputAndAttachMeta batch_num=" + std::to_string(batch->inbuf_batch_num);
-    eventAttrib.message.ascii = nvtx_str.c_str();
-    nvtxDomainRangePushEx(dsretailytics->nvtx_domain, &eventAttrib);
-
-    /* For each frame attach metadata output. */
-    for (guint i = 0; i < batch->frames.size (); i++) {
-      if (dsretailytics->process_full_frame) {
-        // Process to get the output
-        output =
-            DsRetailyticsProcess (dsretailytics->dsretailyticslib_ctx,
-            batch->cvmat[i].data);
-        // Attach the metadata for the full frame
-        attach_metadata_full_frame (dsretailytics, batch->frames[i].frame_meta,
-            scale_ratio, output, i);
-        free (output);
-      } else {
-        GstDsRetailyticsFrame & frame = batch->frames[i];
-
-        obj_meta = frame.obj_meta;
-
-        /* Should not process on objects smaller than MIN_INPUT_OBJECT_WIDTH x MIN_INPUT_OBJECT_HEIGHT
-         * since it will cause hardware scaling issues. */
-        if (obj_meta->rect_params.width < MIN_INPUT_OBJECT_WIDTH ||
-            obj_meta->rect_params.height < MIN_INPUT_OBJECT_HEIGHT)
-          continue;
-
-        // Process the object crop to obtain label
-        output = DsRetailyticsProcess (dsretailytics->dsretailyticslib_ctx,
-            batch->cvmat[i].data);
-
-        // Attach labels for the object
-        attach_metadata_object (dsretailytics, obj_meta, output);
-
-        free (output);
-      }
-    }
-
-    g_mutex_lock (&dsretailytics->process_lock);
-
-    g_queue_push_tail (dsretailytics->cvmat_queue, batch->cvmat);
-    g_cond_broadcast (&dsretailytics->cvmat_cond);
-
-    nvtxDomainRangePop (dsretailytics->nvtx_domain);
-  }
-  g_mutex_unlock (&dsretailytics->process_lock);
-
-  return nullptr;
 }
 
 /**
@@ -1227,5 +991,4 @@ dsretailytics_plugin_init (GstPlugin * plugin)
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
     nvdsgst_dsretailytics,
-    DESCRIPTION, dsretailytics_plugin_init, "1.0", LICENSE, BINARY_PACKAGE,
-    URL)
+    DESCRIPTION, dsretailytics_plugin_init, "5.1", LICENSE, BINARY_PACKAGE, URL)
