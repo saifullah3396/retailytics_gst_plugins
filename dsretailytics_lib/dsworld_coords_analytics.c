@@ -20,30 +20,30 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include "dsretailytics_lib.h"
+#include "dsworld_coords_analytics.h"
 #include <stdio.h>
 #include <stdlib.h>
 
-struct DsRetailyticsCtx
+struct DsWorldCoordsAnalyticsCtx
 {
-    DsRetailyticsInitParams initParams;
+    DsWorldCoordsAnalyticsInitParams initParams;
 };
 
-DsRetailyticsCtx *
-DsRetailyticsCtxInit (DsRetailyticsInitParams * initParams)
+DsWorldCoordsAnalyticsCtx *
+DsWorldCoordsAnalyticsCtxInit (DsWorldCoordsAnalyticsInitParams * initParams)
 {
-    DsRetailyticsCtx *ctx = (DsRetailyticsCtx *) calloc (1, sizeof (DsRetailyticsCtx));
+    DsWorldCoordsAnalyticsCtx *ctx = (DsWorldCoordsAnalyticsCtx *) calloc (1, sizeof (DsWorldCoordsAnalyticsCtx));
     ctx->initParams = *initParams;
     return ctx;
 }
 
 // In case of an actual processing library, processing on data wil be completed
 // in this function and output will be returned
-DsRetailyticsOutput *
-DsRetailyticsProcess (DsRetailyticsCtx * ctx, unsigned char *data)
+DsWorldCoordsAnalyticsOutput *
+DsWorldCoordsAnalyticsProcess (DsWorldCoordsAnalyticsCtx * ctx, unsigned char *data)
 {
-    DsRetailyticsOutput *out =
-        (DsRetailyticsOutput*)calloc (1, sizeof (DsRetailyticsOutput));
+    DsWorldCoordsAnalyticsOutput *out =
+        (DsWorldCoordsAnalyticsOutput*)calloc (1, sizeof (DsWorldCoordsAnalyticsOutput));
 
     if (data != NULL)
     {
@@ -54,7 +54,7 @@ DsRetailyticsProcess (DsRetailyticsCtx * ctx, unsigned char *data)
     if (ctx->initParams.fullFrame)
     {
         out->numObjects = 2;
-        out->object[0] = (DsRetailyticsObject)
+        out->object[0] = (DsWorldCoordsAnalyticsObject)
         {
             (float)(ctx->initParams.processingWidth) / 8,
                 (float)(ctx->initParams.processingHeight) / 8,
@@ -62,7 +62,7 @@ DsRetailyticsProcess (DsRetailyticsCtx * ctx, unsigned char *data)
                 (float)(ctx->initParams.processingHeight) / 8, "Obj0"
         };
 
-        out->object[1] = (DsRetailyticsObject)
+        out->object[1] = (DsWorldCoordsAnalyticsObject)
         {
             (float)(ctx->initParams.processingWidth) / 2,
                 (float)(ctx->initParams.processingHeight) / 2,
@@ -73,7 +73,7 @@ DsRetailyticsProcess (DsRetailyticsCtx * ctx, unsigned char *data)
     else
     {
         out->numObjects = 1;
-        out->object[0] = (DsRetailyticsObject)
+        out->object[0] = (DsWorldCoordsAnalyticsObject)
         {
             (float)(ctx->initParams.processingWidth) / 8,
                 (float)(ctx->initParams.processingHeight) / 8,
@@ -88,7 +88,7 @@ DsRetailyticsProcess (DsRetailyticsCtx * ctx, unsigned char *data)
 }
 
 void
-DsRetailyticsCtxDeinit (DsRetailyticsCtx * ctx)
+DsWorldCoordsAnalyticsCtxDeinit (DsWorldCoordsAnalyticsCtx * ctx)
 {
     free (ctx);
 }

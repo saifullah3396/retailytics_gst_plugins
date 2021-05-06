@@ -20,52 +20,44 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __DSRETAILYTICS_LIB__
-#define __DSRETAILYTICS_LIB__
+#ifndef __DSWORLDCOORDSANALYTICS_LIB__
+#define __DSWORLDCOORDSANALYTICS_LIB__
 
 #define MAX_LABEL_SIZE 128
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct DsRetailyticsCtx DsRetailyticsCtx;
+typedef struct DsWorldCoordsAnalyticsCtx DsWorldCoordsAnalyticsCtx;
 
-// Init parameters structure as input, required for instantiating dsretailytics_lib
+/** Maximum batch size to be supported by dsretailytics. */
+#define MAX_CLASS_IDS_PER_ANALYTICS G_MAXINT
+
+// Init parameters structure as input, required for instantiating dsworld_coords_analyticslib
 typedef struct
 {
-  // Width at which frame/object will be scaled
-  int processingWidth;
-  // height at which frame/object will be scaled
-  int processingHeight;
-  // Flag to indicate whether operating on crops of full frame
-  int fullFrame;
-} DsRetailyticsInitParams;
+  // Class ids to this analytics operation on
+  gint class_ids[MAX_CLASS_IDS_PER_ANALYTICS];
 
-// Detected/Labelled object structure, stores bounding box info along with label
+  // Number of class ids attached to this analytics object
+  gint num_classes;
+} DsWorldCoordsAnalyticsInitParams;
+
+// Stores output world coordinates of the object after transformation
 typedef struct
 {
-  float left;
-  float top;
-  float width;
-  float height;
-  char label[MAX_LABEL_SIZE];
-} DsRetailyticsObject;
-
-// Output data returned after processing
-typedef struct
-{
-  int numObjects;
-  DsRetailyticsObject object[4];
-} DsRetailyticsOutput;
+  float world_coords_x;
+  float world_coords_y;
+} DsWorldCoordsAnalyticsObject;
 
 // Initialize library context
-DsRetailyticsCtx * DsRetailyticsCtxInit (DsRetailyticsInitParams *init_params);
+DsWorldCoordsAnalyticsCtx * DsWorldCoordsAnalyticsCtxInit (DsWorldCoordsAnalyticsInitParams *init_params);
 
 // Dequeue processed output
-DsRetailyticsOutput *DsRetailyticsProcess (DsRetailyticsCtx *ctx, unsigned char *data);
+void *DsWorldCoordsAnalyticsProcess (DsWorldCoordsAnalyticsCtx *ctx, NvDsBatchMeta *batch_meta);
 
 // Deinitialize library context
-void DsRetailyticsCtxDeinit (DsRetailyticsCtx *ctx);
+void DsWorldCoordsAnalyticsCtxDeinit (DsWorldCoordsAnalyticsCtx *ctx);
 
 #ifdef __cplusplus
 }

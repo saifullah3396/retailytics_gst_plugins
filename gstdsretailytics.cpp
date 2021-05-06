@@ -30,8 +30,8 @@
 #include <sys/time.h>
 GST_DEBUG_CATEGORY_STATIC (gst_dsretailytics_debug);
 #define GST_CAT_DEFAULT gst_dsretailytics_debug
-#define USE_EGLIMAGE 1
-/* enable to write transformed cvmat to files */
+
+/* enable to write generated analytics output to files */
 /* #define DSRETAILYTICS_DEBUG */
 static GQuark _dsmeta_quark = 0;
 
@@ -40,61 +40,16 @@ enum
 {
   PROP_0,
   PROP_UNIQUE_ID,
-  PROP_PROCESSING_WIDTH,
-  PROP_PROCESSING_HEIGHT,
-  PROP_PROCESS_FULL_FRAME,
-  PROP_BLUR_OBJECTS,
-  PROP_GPU_DEVICE_ID
+  PROP_GENERATE_WORLD_COORDS_ANALYTICS,
 };
-
-#define CHECK_NVDS_MEMORY_AND_GPUID(object, surface)  \
-  ({ int _errtype=0;\
-   do {  \
-    if ((surface->memType == NVBUF_MEM_DEFAULT || surface->memType == NVBUF_MEM_CUDA_DEVICE) && \
-        (surface->gpuId != object->gpu_id))  { \
-    GST_ELEMENT_ERROR (object, RESOURCE, FAILED, \
-        ("Input surface gpu-id doesnt match with configured gpu-id for element," \
-         " please allocate input using unified memory, or use same gpu-ids"),\
-        ("surface-gpu-id=%d,%s-gpu-id=%d",surface->gpuId,GST_ELEMENT_NAME(object),\
-         object->gpu_id)); \
-    _errtype = 1;\
-    } \
-    } while(0); \
-    _errtype; \
-  })
-
 
 /* Default values for properties */
 #define DEFAULT_UNIQUE_ID 15
-#define DEFAULT_PROCESSING_WIDTH 640
-#define DEFAULT_PROCESSING_HEIGHT 480
-#define DEFAULT_PROCESS_FULL_FRAME TRUE
-#define DEFAULT_BLUR_OBJECTS FALSE
-#define DEFAULT_GPU_ID 0
+#define DEFAULT_GENERATE_WORLD_COORDS_ANALYTICS "0,1,2"
 
-#define RGB_BYTES_PER_PIXEL 3
-#define RGBA_BYTES_PER_PIXEL 4
-#define Y_BYTES_PER_PIXEL 1
-#define UV_BYTES_PER_PIXEL 2
-
+/* Minimum object width and height for which analytics are generated */
 #define MIN_INPUT_OBJECT_WIDTH 16
 #define MIN_INPUT_OBJECT_HEIGHT 16
-
-#define CHECK_NPP_STATUS(npp_status,error_str) do { \
-  if ((npp_status) != NPP_SUCCESS) { \
-    g_print ("Error: %s in %s at line %d: NPP Error %d\n", \
-        error_str, __FILE__, __LINE__, npp_status); \
-    goto error; \
-  } \
-} while (0)
-
-#define CHECK_CUDA_STATUS(cuda_status,error_str) do { \
-  if ((cuda_status) != cudaSuccess) { \
-    g_print ("Error: %s in %s at line %d (%s)\n", \
-        error_str, __FILE__, __LINE__, cudaGetErrorName(cuda_status)); \
-    goto error; \
-  } \
-} while (0)
 
 /* By default NVIDIA Hardware allocated memory flows through the pipeline. We
  * will be processing on this type of memory only. */
@@ -105,7 +60,7 @@ GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
         (GST_CAPS_FEATURE_MEMORY_NVMM,
-            "{ NV12, RGBA, I420 }")));
+            "{ RGBA }")));
 
 static GstStaticPadTemplate gst_dsretailytics_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
@@ -113,7 +68,7 @@ GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
         (GST_CAPS_FEATURE_MEMORY_NVMM,
-            "{ NV12, RGBA, I420 }")));
+            "{ RGBA }")));
 
 /* Define our element type. Standard GObject/GStreamer boilerplate stuff */
 #define gst_dsretailytics_parent_class parent_class
@@ -138,6 +93,12 @@ attach_metadata_full_frame (GstDsRetailytics * dsretailytics, NvDsFrameMeta *fra
 static void attach_metadata_object (GstDsRetailytics * dsretailytics,
     NvDsObjectMeta * obj_meta, DsRetailyticsOutput * output);
 
+static gboolean gst_nvds_dsretailytics_parse_analytics_class_ids (
+    GstDsAppAnalytics * analytics,
+    const gchar * arr);
+static gboolean gst_nvds_dsretailytics_get_analytics_class_ids (GValue * value,
+    GstDsAppAnalytics * analytics);
+
 /* Install properties, set sink and src pad capabilities, override the required
  * functions of the base class, These are common to all instances of the
  * element.
@@ -149,8 +110,8 @@ gst_dsretailytics_class_init (GstDsRetailyticsClass * klass)
   GstElementClass *gstelement_class;
   GstBaseTransformClass *gstbasetransform_class;
 
-  /* Indicates we want to use DS buf api */
-  g_setenv ("DS_NEW_BUFAPI", "1", TRUE);
+//   /* Indicates we want to use DS buf api */ @todo: check this parameter
+//   g_setenv ("DS_NEW_BUFAPI", "1", TRUE); @todo: check this parameter
 
   gobject_class = (GObjectClass *) klass;
   gstelement_class = (GstElementClass *) klass;
@@ -175,42 +136,17 @@ gst_dsretailytics_class_init (GstDsRetailyticsClass * klass)
           " element", 0, G_MAXUINT, DEFAULT_UNIQUE_ID, (GParamFlags)
           (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
-  g_object_class_install_property (gobject_class, PROP_PROCESSING_WIDTH,
-      g_param_spec_int ("processing-width",
-          "Processing Width",
-          "Width of the input buffer to algorithm",
-          1, G_MAXINT, DEFAULT_PROCESSING_WIDTH, (GParamFlags)
-          (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_GENERATE_WORLD_COORDS_ANALYTICS,
+      g_param_spec_string ("generate-world-coords-analytics",
+          "Generate world coordinate analytics",
+          "Generate world coordinate analytics based on homography for the "
+          "given class ids separated by colons.\n"
+          "\t\t\t Set class ids to enable the analytics for given ids as follows:\n"
+          "\t\t\t ClassId 1(int), ClassId 2(int), ClassId 3(int)\n",
+          "\t\t\t e.g. 0,1,2,3\n",
+          DEFAULT_GENERATE_WORLD_COORDS_ANALYTICS,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
-  g_object_class_install_property (gobject_class, PROP_PROCESSING_HEIGHT,
-      g_param_spec_int ("processing-height",
-          "Processing Height",
-          "Height of the input buffer to algorithm",
-          1, G_MAXINT, DEFAULT_PROCESSING_HEIGHT, (GParamFlags)
-          (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_PROCESS_FULL_FRAME,
-      g_param_spec_boolean ("full-frame",
-          "Full frame",
-          "Enable to process full frame or disable to process objects detected"
-          "by primary detector", DEFAULT_PROCESS_FULL_FRAME, (GParamFlags)
-          (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_BLUR_OBJECTS,
-      g_param_spec_boolean ("blur-objects",
-          "Blur Objects",
-          "Enable to blur the objects detected in full-frame=0 mode"
-          "by primary detector", DEFAULT_BLUR_OBJECTS, (GParamFlags)
-          (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_GPU_DEVICE_ID,
-      g_param_spec_uint ("gpu-id",
-          "Set GPU Device ID",
-          "Set GPU Device ID", 0,
-          G_MAXUINT, 0,
-          GParamFlags
-          (G_PARAM_READWRITE |
-              G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
   /* Set sink and src pad capabilities */
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&gst_dsretailytics_src_template));
@@ -239,11 +175,8 @@ gst_dsretailytics_init (GstDsRetailytics * dsretailytics)
 
   /* Initialize all property variables to default values */
   dsretailytics->unique_id = DEFAULT_UNIQUE_ID;
-  dsretailytics->processing_width = DEFAULT_PROCESSING_WIDTH;
-  dsretailytics->processing_height = DEFAULT_PROCESSING_HEIGHT;
-  dsretailytics->process_full_frame = DEFAULT_PROCESS_FULL_FRAME;
-  dsretailytics->blur_objects = DEFAULT_BLUR_OBJECTS;
-  dsretailytics->gpu_id = DEFAULT_GPU_ID;
+  dsretailytics->generate_world_coords_analytics =
+    DEFAULT_GENERATE_WORLD_COORDS_ANALYTICS;
 
   /* This quark is required to identify NvDsMeta when iterating through
    * the buffer metadatas */
@@ -262,20 +195,11 @@ gst_dsretailytics_set_property (GObject * object, guint prop_id,
     case PROP_UNIQUE_ID:
       dsretailytics->unique_id = g_value_get_uint (value);
       break;
-    case PROP_PROCESSING_WIDTH:
-      dsretailytics->processing_width = g_value_get_int (value);
-      break;
-    case PROP_PROCESSING_HEIGHT:
-      dsretailytics->processing_height = g_value_get_int (value);
-      break;
-    case PROP_PROCESS_FULL_FRAME:
-      dsretailytics->process_full_frame = g_value_get_boolean (value);
-      break;
-    case PROP_BLUR_OBJECTS:
-      dsretailytics->blur_objects = g_value_get_boolean (value);
-      break;
-    case PROP_GPU_DEVICE_ID:
-      dsretailytics->gpu_id = g_value_get_uint (value);
+    case PROP_WORLD_COORDS_ANALYTICS:
+      dsretailytics->world_coords_analytics.enable = TRUE;
+      gst_nvds_dsretailytics_parse_analytics_class_ids (
+          dsretailytics->world_coords_analytics,
+          g_value_get_string (value));
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -296,20 +220,9 @@ gst_dsretailytics_get_property (GObject * object, guint prop_id,
     case PROP_UNIQUE_ID:
       g_value_set_uint (value, dsretailytics->unique_id);
       break;
-    case PROP_PROCESSING_WIDTH:
-      g_value_set_int (value, dsretailytics->processing_width);
-      break;
-    case PROP_PROCESSING_HEIGHT:
-      g_value_set_int (value, dsretailytics->processing_height);
-      break;
-    case PROP_PROCESS_FULL_FRAME:
-      g_value_set_boolean (value, dsretailytics->process_full_frame);
-      break;
-    case PROP_BLUR_OBJECTS:
-      g_value_set_boolean (value, dsretailytics->blur_objects);
-      break;
-    case PROP_GPU_DEVICE_ID:
-      g_value_set_uint (value, dsretailytics->gpu_id);
+    case PROP_GENERATE_WORLD_COORDS_ANALYTICS:
+      gst_nvds_dsretailytics_get_analytics_class_ids (
+          value, dsretailytics->world_coords_analytics);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -973,6 +886,51 @@ attach_metadata_object (GstDsRetailytics * dsretailytics, NvDsObjectMeta * obj_m
     0, 0, 0, 1};
   }
   nvds_release_meta_lock (batch_meta);
+}
+
+
+static gboolean
+gst_nvds_dsretailytics_parse_analytics_class_ids (
+    GstDsAppAnalytics * analytics,
+    const gchar * arr)
+{
+  gchar *str = (gchar *) arr;
+  int idx = 0;
+
+  while (str != NULL && str[0] != '\0') {
+    class_id = atoi (str);
+    analytics->class_ids[idx] = class_id;
+    str = g_strstr_len (str, -1, ",");
+    if (str) {
+      str = str + 1;
+    }
+    idx++;
+    if (idx >= MAX_CLASS_IDS_PER_ANALYTICS) {
+      g_print ("idx (%d) entries exceeded MAX_CLASS_IDS_PER_ANALYTICS %d\n", idx, MAX_BG_CLR);
+      break;
+    }
+  }
+
+  analytics->num_classes = idx;
+  return TRUE;
+}
+
+static gboolean
+gst_nvds_dsretailytics_get_analytics_class_ids (
+    GValue * value,
+    GstDsAppAnalytics * analytics)
+{
+  int idx = 0;
+  gchar arr[100];
+
+  while (idx < (analytics->num_classes - 1)) {
+    sprintf (arr, "%d,", analytics->class_ids[idx]);
+    idx++;
+  }
+  sprintf (arr, "%d", analytics->class_ids[idx]);
+
+  g_value_set_string (value, arr);
+  return TRUE;
 }
 
 /**

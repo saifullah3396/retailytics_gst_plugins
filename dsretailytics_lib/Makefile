@@ -21,5 +21,5 @@
 #################################################################################
 
 all:
-	gcc -ggdb -c -o dsretailytics_lib.o -fPIC dsretailytics_lib.c
-	ar rcs libdsretailytics.a dsretailytics_lib.o
+	gcc -ggdb -c -o dsworld_coords_analytics.o -fPIC dsworld_coords_analytics.c
+	ar rcs libdsworld_coords_analytics.a dsworld_coords_analytics.o
